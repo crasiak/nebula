@@ -231,6 +231,7 @@ func (s *Service) Listen(network, address string) (net.Listener, error) {
 		s:      s,
 		addr:   addr,
 		accept: make(chan net.Conn),
+		closed: make(chan struct{}),
 	}
 
 	s.mu.Lock()
@@ -256,10 +257,12 @@ func (s *Service) Close() error {
 func (s *Service) tcpHandler(r *tcp.ForwarderRequest) {
 	endpointID := r.ID()
 
+	// Only hold the lock for the lookup. CreateEndpoint runs the whole
+	// handshake, which takes 127s to time out when the peer never answers our
+	// SYN-ACK, and every other connection, Listen and Close would wait on it.
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	l, ok := s.mu.listeners[endpointID.LocalPort]
+	s.mu.Unlock()
 	if !ok {
 		r.Complete(true)
 		return
@@ -276,5 +279,10 @@ func (s *Service) tcpHandler(r *tcp.ForwarderRequest) {
 	ep.SocketOptions().SetKeepAlive(true)
 
 	conn := gonet.NewTCPConn(&wq, ep)
-	l.accept <- conn
+	// Nobody may ever accept this connection, so give up when the listener closes
+	select {
+	case l.accept <- conn:
+	case <-l.closed:
+		conn.Close()
+	}
 }

@@ -1,7 +1,6 @@
 package service
 
 import (
-	"io"
 	"net"
 )
 
@@ -10,22 +9,39 @@ type tcpListener struct {
 	s      *Service
 	addr   *net.TCPAddr
 	accept chan net.Conn
+	// closed is closed by Close. accept is never closed, since a handler may
+	// still be offering a connection on it.
+	closed chan struct{}
 }
 
 func (l *tcpListener) Accept() (net.Conn, error) {
-	conn, ok := <-l.accept
-	if !ok {
-		return nil, io.EOF
+	// Don't hand out a connection that is on offer after Close
+	select {
+	case <-l.closed:
+		return nil, net.ErrClosed
+	default:
 	}
-	return conn, nil
+
+	select {
+	case conn := <-l.accept:
+		return conn, nil
+	case <-l.closed:
+		return nil, net.ErrClosed
+	}
 }
 
 func (l *tcpListener) Close() error {
 	l.s.mu.Lock()
 	defer l.s.mu.Unlock()
-	delete(l.s.mu.listeners, uint16(l.addr.Port))
 
-	close(l.accept)
+	// If we are no longer registered we were already closed, and the port may
+	// belong to a newer listener
+	if l.s.mu.listeners[l.port] != l {
+		return net.ErrClosed
+	}
+	delete(l.s.mu.listeners, l.port)
+
+	close(l.closed)
 
 	return nil
 }
