@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"unsafe"
@@ -20,11 +21,15 @@ import (
 )
 
 type StdConn struct {
-	sysFd  int
-	closed atomic.Bool
-	isV4   bool
-	l      *slog.Logger
-	batch  int
+	sysFd     int // immutable; owned until Close has drained all reserved operations
+	closed    atomic.Bool
+	fdMu      sync.Mutex // coordinates operation admission with the closed transition
+	fdOps     sync.WaitGroup
+	closeOnce sync.Once
+	closeErr  error
+	isV4      bool
+	l         *slog.Logger
+	batch     int
 }
 
 func NewListener(l *slog.Logger, ip netip.Addr, port int, multi bool, batch int) (Conn, error) {
@@ -75,31 +80,68 @@ func (u *StdConn) Rebind() error {
 	return nil
 }
 
+// reserveFD keeps the descriptor owned through one raw operation, including the
+// gap between admission and entering the syscall. Never retain a reservation
+// across a packet callback: callbacks may themselves call Close.
+func (u *StdConn) reserveFD() error {
+	u.fdMu.Lock()
+	defer u.fdMu.Unlock()
+	if u.closed.Load() {
+		return net.ErrClosed
+	}
+	u.fdOps.Add(1)
+	return nil
+}
+
+func (u *StdConn) releaseFD() {
+	u.fdOps.Done()
+}
+
+func (u *StdConn) setSockOptInt(option, value int) error {
+	if err := u.reserveFD(); err != nil {
+		return err
+	}
+	defer u.releaseFD()
+	return unix.SetsockoptInt(u.sysFd, unix.SOL_SOCKET, option, value)
+}
+
+func (u *StdConn) getSockOptInt(option int) (int, error) {
+	if err := u.reserveFD(); err != nil {
+		return 0, err
+	}
+	defer u.releaseFD()
+	return unix.GetsockoptInt(u.sysFd, unix.SOL_SOCKET, option)
+}
+
 func (u *StdConn) SetRecvBuffer(n int) error {
-	return unix.SetsockoptInt(u.sysFd, unix.SOL_SOCKET, unix.SO_RCVBUFFORCE, n)
+	return u.setSockOptInt(unix.SO_RCVBUFFORCE, n)
 }
 
 func (u *StdConn) SetSendBuffer(n int) error {
-	return unix.SetsockoptInt(u.sysFd, unix.SOL_SOCKET, unix.SO_SNDBUFFORCE, n)
+	return u.setSockOptInt(unix.SO_SNDBUFFORCE, n)
 }
 
 func (u *StdConn) SetSoMark(mark int) error {
-	return unix.SetsockoptInt(u.sysFd, unix.SOL_SOCKET, unix.SO_MARK, mark)
+	return u.setSockOptInt(unix.SO_MARK, mark)
 }
 
 func (u *StdConn) GetRecvBuffer() (int, error) {
-	return unix.GetsockoptInt(u.sysFd, unix.SOL_SOCKET, unix.SO_RCVBUF)
+	return u.getSockOptInt(unix.SO_RCVBUF)
 }
 
 func (u *StdConn) GetSendBuffer() (int, error) {
-	return unix.GetsockoptInt(u.sysFd, unix.SOL_SOCKET, unix.SO_SNDBUF)
+	return u.getSockOptInt(unix.SO_SNDBUF)
 }
 
 func (u *StdConn) GetSoMark() (int, error) {
-	return unix.GetsockoptInt(u.sysFd, unix.SOL_SOCKET, unix.SO_MARK)
+	return u.getSockOptInt(unix.SO_MARK)
 }
 
 func (u *StdConn) LocalAddr() (netip.AddrPort, error) {
+	if err := u.reserveFD(); err != nil {
+		return netip.AddrPort{}, err
+	}
+	defer u.releaseFD()
 	sa, err := unix.Getsockname(u.sysFd)
 	if err != nil {
 		return netip.AddrPort{}, err
@@ -116,6 +158,10 @@ func (u *StdConn) LocalAddr() (netip.AddrPort, error) {
 
 // recvmmsg does one blocking recvmmsg (MSG_WAITFORONE), reading up to len(msgs) datagrams
 func (u *StdConn) recvmmsg(msgs []rawMessage) (int, error) {
+	if err := u.reserveFD(); err != nil {
+		return 0, err
+	}
+	defer u.releaseFD()
 	r, _, errno := unix.Syscall6(
 		unix.SYS_RECVMMSG,
 		uintptr(u.sysFd),
@@ -140,6 +186,10 @@ func (u *StdConn) recvmmsg(msgs []rawMessage) (int, error) {
 
 // recvmsg does one blocking recvmsg into msgs[0]
 func (u *StdConn) recvmsg(msgs []rawMessage) (int, error) {
+	if err := u.reserveFD(); err != nil {
+		return 0, err
+	}
+	defer u.releaseFD()
 	r, _, errno := unix.Syscall6(
 		unix.SYS_RECVMSG,
 		uintptr(u.sysFd),
@@ -201,6 +251,10 @@ func (u *StdConn) WriteTo(b []byte, ip netip.AddrPort) error {
 }
 
 func (u *StdConn) writeTo6(b []byte, ip netip.AddrPort) error {
+	if err := u.reserveFD(); err != nil {
+		return err
+	}
+	defer u.releaseFD()
 	var rsa unix.RawSockaddrInet6
 	rsa.Family = unix.AF_INET6
 	rsa.Addr = ip.Addr().As16()
@@ -227,6 +281,10 @@ func (u *StdConn) writeTo4(b []byte, ip netip.AddrPort) error {
 	if !ip.Addr().Is4() {
 		return ErrInvalidIPv6RemoteForSocket
 	}
+	if err := u.reserveFD(); err != nil {
+		return err
+	}
+	defer u.releaseFD()
 
 	var rsa unix.RawSockaddrInet4
 	rsa.Family = unix.AF_INET
@@ -293,6 +351,10 @@ func (u *StdConn) ReloadConfig(c *config.C) {
 }
 
 func (u *StdConn) getMemInfo(meminfo *[unix.SK_MEMINFO_VARS]uint32) error {
+	if err := u.reserveFD(); err != nil {
+		return err
+	}
+	defer u.releaseFD()
 	var vallen uint32 = 4 * unix.SK_MEMINFO_VARS
 	_, _, err := unix.Syscall6(unix.SYS_GETSOCKOPT, uintptr(u.sysFd), uintptr(unix.SOL_SOCKET), uintptr(unix.SO_MEMINFO), uintptr(unsafe.Pointer(meminfo)), uintptr(unsafe.Pointer(&vallen)), 0)
 	if err != 0 {
@@ -302,12 +364,21 @@ func (u *StdConn) getMemInfo(meminfo *[unix.SK_MEMINFO_VARS]uint32) error {
 }
 
 func (u *StdConn) Close() error {
-	u.closed.Store(true)
-	// Wake the reader parked in recvmmsg/recvmsg. shutdown(2) on an unconnected socket
-	// returns ENOTCONN but still wakes it, so ignore the error.
-	// The reader then sees closed and stops touching the fd, making the Close below safe.
-	_ = unix.Shutdown(u.sysFd, unix.SHUT_RDWR)
-	return unix.Close(u.sysFd)
+	u.closeOnce.Do(func() {
+		u.fdMu.Lock()
+		u.closed.Store(true)
+		u.fdMu.Unlock()
+
+		// No more reservations can be added. Wake blocking reads before waiting
+		// for admitted operations, including ones not yet inside their syscall.
+		// Unconnected UDP may return ENOTCONN while still waking readers.
+		_ = unix.Shutdown(u.sysFd, unix.SHUT_RDWR)
+		u.fdOps.Wait()
+		u.closeErr = unix.Close(u.sysFd)
+	})
+	// Concurrent/repeated Close calls wait for the same release, never touching
+	// a descriptor that might now belong to another socket.
+	return u.closeErr
 }
 
 func NewUDPStatsEmitter(udpConns []Conn) func() {
